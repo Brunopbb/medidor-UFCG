@@ -4,7 +4,7 @@
 #include <ESP8266httpUpdate.h>
 #include "secrets.h"
 
-#define FIRMWARE_VERSION "1.0.6" 
+#define FIRMWARE_VERSION "1.0.11" 
 
 const char *SSID = SECRET_SSID;
 const char *PASSWORD = SECRET_PASSWORD;
@@ -12,14 +12,17 @@ const char *BROKER = SECRET_BROKER;
 const char *URL_VERSAO = SECRET_URL_VERSAO;
 const char *URL_FIRMWARE = SECRET_URL_FIRMWARE;
 
-const char *CLIENT_ID = "MEDIDOR_UFCG_LABMET";
+const char *CLIENT_ID = "MEDIDOR_UFCG";           // medidor de CASA (o do LABMET usa MEDIDOR_UFCG_LABMET)
 const char *TOPIC_PUBLISH = "/UFCG/pwrc/";
 const char *TOPIC_LOG = "/UFCG/pwrc/log";
-const char *TOPIC_SUBSCRIBE = "MEDIDOR_UFCG_CONTROLE_LAB";
+const char *TOPIC_SUBSCRIBE = "MEDIDOR_UFCG_CONTROLE_CASA";
 
 String Leitura = "";
 int tentativa;
 unsigned long Agora;
+unsigned long ultimaTentativaMQTT = 0;
+unsigned long ultimoStatus = 0;
+unsigned long ultimoOTA = 0;
 
 void ConnectWifi(void);
 void connectMQTT(void); 
@@ -35,9 +38,11 @@ void setup() {
   
   // Linha em branco para limpar lixo do boot no Monitor Serial
   Serial.println();
-  Serial.println("=== BOOT: MEDIDOR LABMET ===");
+  Serial.println("=== BOOT: MEDIDOR CASA ===");
   
   client.setBufferSize(512);
+  client.setKeepAlive(60);   // era 15s: curto demais para enlace com perda
+  client.setSocketTimeout(20);
   client.setCallback(Callback);
   
   ConnectWifi();
@@ -91,13 +96,34 @@ void loop() {
     connectMQTT();
   }
 
-  client.loop();
+  // --- GUARDIÃO MQTT: reconecta assim que cair, sem esperar chegar JSON ---
+  if (!client.connected()) {
+    if (millis() - ultimaTentativaMQTT > 5000) {
+      ultimaTentativaMQTT = millis();
+      Serial.println("AVISO: MQTT caiu. Tentando reconectar...");
+      if (client.connect(CLIENT_ID, SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
+        client.subscribe(TOPIC_SUBSCRIBE);
+        Serial.println("MQTT reconectado.");
+      }
+    }
+  } else {
+    client.loop();
+  }
+
+  // --- Diagnostico de rede a cada 60s ---
+  if (client.connected() && (millis() - ultimoStatus > 60000)) {
+    ultimoStatus = millis();
+    // Buffer fixo em vez de concatenar String: no ESP8266 a concatenacao cria
+    // temporarios que fragmentam o heap (~390 B/min medidos em 29/08).
+    char st[110];
+    snprintf(st, sizeof(st), "RSSI=%ddBm IP=%s heap=%u frag=%u%% up=%lus",
+             WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapFragmentation(),
+             millis() / 1000UL);
+    client.publish(TOPIC_LOG, st);
+  }
 
   if (Leitura != "") {
-    if (!client.connected()) {
-      Serial.println("AVISO: Cliente MQTT desconectado! Reconectando antes de enviar...");
-      connectMQTT();
-    }
     
     // --- O GUARDIÃO DO JSON ---
     if (Leitura.startsWith("{")) {
@@ -117,14 +143,27 @@ void ConnectWifi(void) {
   tentativa = 0;
   Serial.print("Conectando a rede Wi-Fi: ");
   Serial.println(SSID);
-  
+
+  // NAO usar WIFI_NONE_SLEEP nesta placa: o radio sempre ligado sobe o consumo
+  // de ~15mA medios para ~70mA constantes. Medido em 29/08: sem ganho de cobertura.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  WiFi.setAutoReconnect(true);
+
+  // O SDK guarda canal e BSSID do ultimo AP em flash e tenta por ali primeiro.
+  // Se o roteador muda de canal (modo automatico, ou mudanca manual), esse cache
+  // fica obsoleto e a associacao falha em loop. Limpar forca varredura completa.
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(100);
+
   WiFi.begin(SSID , PASSWORD);
   
-  while ((WiFi.status() != WL_CONNECTED) && (tentativa < 15)) {
+  while ((WiFi.status() != WL_CONNECTED) && (tentativa < 45)) {
     tentativa++;
     Serial.print("Tentativa de conexao Wi-Fi ");
     Serial.print(tentativa);
-    Serial.println("/15...");
+    Serial.println("/45...");
     delay(1000);
   }
   
@@ -167,37 +206,67 @@ void connectMQTT(void) {
 }
 
 void checkAndDownloadUpdate(void) {
-  WiFiClient updateClient; 
+  // Tentativas repetidas de OTA que falham nao liberam toda a memoria alocada.
+  // Observado em 29/08: 10 tentativas seguidas derrubaram o heap em ~8 KB.
+  if (ultimoOTA != 0 && (millis() - ultimoOTA) < 180000) {
+    client.publish(TOPIC_LOG, "OTA ignorado: aguarde 3 min entre tentativas.");
+    return;
+  }
+  ultimoOTA = millis();
+
+  WiFiClient updateClient;
   HTTPClient http;
-  
+
+  // Timeout padrao e 5s: curto demais para 300 KB em enlace com perda de pacotes.
+  updateClient.setTimeout(20000);
+
   Serial.println("Buscando atualizacoes OTA...");
   http.begin(updateClient, URL_VERSAO);
+  http.setTimeout(15000);
   int httpCode = http.GET();
 
+  String serverVersion = "";
   if (httpCode == HTTP_CODE_OK) {
-    String serverVersion = http.getString();
-    serverVersion.trim(); 
-    Serial.print("Versao no servidor: ");
-    Serial.println(serverVersion);
-    
-    if (serverVersion != FIRMWARE_VERSION) {
-      Serial.println("Nova versao encontrada! Iniciando download...");
-      client.publish(TOPIC_LOG, "Baixando nova versao...");
-      client.disconnect(); 
-      t_httpUpdate_return ret = ESPhttpUpdate.update(updateClient, URL_FIRMWARE);
-      if (ret == HTTP_UPDATE_OK) {
-        Serial.println("Atualizacao OTA concluida com sucesso!");
-        client.publish(TOPIC_LOG, "Sucesso!");
-      } else {
-        Serial.println("Erro na atualizacao OTA.");
-      }
-    } else {
-      Serial.println("O firmware ja esta na versao mais recente.");
-      client.publish(TOPIC_LOG, "Firmware atualizado.");
-    }
-  } else {
-    Serial.print("Erro ao verificar versao. HTTP Code: ");
-    Serial.println(httpCode);
+    serverVersion = http.getString();
+    serverVersion.trim();
   }
+  // Libera o WiFiClient ANTES do update: o ESPhttpUpdate precisa dele livre.
   http.end();
+
+  if (httpCode != HTTP_CODE_OK) {
+    String erro = "Falha ao checar versao. HTTP=" + String(httpCode);
+    Serial.println(erro);
+    client.publish(TOPIC_LOG, erro.c_str());
+    return;
+  }
+
+  Serial.print("Versao no servidor: ");
+  Serial.println(serverVersion);
+
+  if (serverVersion == FIRMWARE_VERSION) {
+    Serial.println("O firmware ja esta na versao mais recente.");
+    client.publish(TOPIC_LOG, "Firmware ja atualizado.");
+    return;
+  }
+
+  String msg = "Baixando " + serverVersion + " (atual " + String(FIRMWARE_VERSION) + ")...";
+  Serial.println(msg);
+  client.publish(TOPIC_LOG, msg.c_str());
+  delay(200);
+  client.disconnect();
+
+  ESPhttpUpdate.rebootOnUpdate(true);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret = ESPhttpUpdate.update(updateClient, URL_FIRMWARE);
+
+  if (ret == HTTP_UPDATE_OK) {
+    Serial.println("Atualizacao OTA concluida!");   // reinicia sozinho
+  } else {
+    String falha = "Falha OTA (" + String((int)ret) + "): " + ESPhttpUpdate.getLastErrorString();
+    Serial.println(falha);
+    if (client.connect(CLIENT_ID, SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
+      client.subscribe(TOPIC_SUBSCRIBE);
+      client.publish(TOPIC_LOG, falha.c_str());
+    }
+  }
 }

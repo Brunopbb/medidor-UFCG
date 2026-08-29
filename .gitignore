@@ -1,0 +1,9 @@
+# Credenciais - nunca versionar
+.env
+src/MEDIDOR_UFCG_ESP8266/secrets.h
+
+# Build do Arduino
+build/
+*.bin
+*.elf
+*.hex

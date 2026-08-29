@@ -117,14 +117,18 @@ void setup() {
 }
 
 void loop() {
-  wdt_enable(WDTO_250MS);
+  wdt_enable(WDTO_1S);   // 250ms era apertado: o JSON leva ~160ms a 19200 baud
 
   // --- LEITURA DE COMANDOS DO ESP8266 ---
   while (ESP8266.available() > 0) {
     c = ESP8266.read();
-    if (c == 'Q') contador = 1;
-    if (c == 'M') { COMANDO = COMANDO + c; contador = 2; }
-    if (contador == 1) COMANDO = COMANDO + c;
+    // 'Q' inicia um comando novo: limpa o buffer para nao concatenar lixo anterior
+    if (c == 'Q') { COMANDO = ""; contador = 1; }
+    else if (c == 'M' && contador == 1) { COMANDO += c; contador = 2; break; }
+    else if (contador == 1) {
+      if (COMANDO.length() < 40) COMANDO += c;
+      else { COMANDO = ""; contador = 0; }   // sem terminador: descarta
+    }
   }
 
   if (contador == 2) {
@@ -142,7 +146,7 @@ void loop() {
       EEPROM.put(ADDR_GAIN_UA, novoGanho); EEPROM.put(ADDR_GAIN_UB, novoGanho); EEPROM.put(ADDR_GAIN_UC, novoGanho);
       write16(0x61, novoGanho); write16(0x65, novoGanho); write16(0x69, novoGanho);
       ESP8266.println("{\"INFO\":\"Calibracao Tensao ALL Salva!\"}");
-      wdt_enable(WDTO_250MS); 
+      wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_I_ALL:")) {
       float ref = COMANDO.substring(13, COMANDO.length() - 1).toFloat();
@@ -151,7 +155,7 @@ void loop() {
       EEPROM.put(ADDR_GAIN_IA, novoGanho); EEPROM.put(ADDR_GAIN_IB, novoGanho); EEPROM.put(ADDR_GAIN_IC, novoGanho);
       write16(0x62, novoGanho); write16(0x66, novoGanho); write16(0x6A, novoGanho);
       ESP8266.println("{\"INFO\":\"Calibracao Corrente ALL Salva!\"}");
-      wdt_enable(WDTO_250MS); 
+      wdt_enable(WDTO_1S); 
     }
     
     // ====================================================================
@@ -163,19 +167,19 @@ void loop() {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UA, ref);
       EEPROM.put(ADDR_GAIN_UA, novoGanho); write16(0x61, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao VA Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao VA Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_VB:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UB, ref);
       EEPROM.put(ADDR_GAIN_UB, novoGanho); write16(0x65, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao VB Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao VB Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_VC:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UC, ref);
       EEPROM.put(ADDR_GAIN_UC, novoGanho); write16(0x69, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao VC Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao VC Salva!\"}"); wdt_enable(WDTO_1S); 
     }
 
     // --- CORRENTE (IA, IB, IC) ---
@@ -183,19 +187,19 @@ void loop() {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IA, ref);
       EEPROM.put(ADDR_GAIN_IA, novoGanho); write16(0x62, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao IA Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao IA Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_IB:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IB, ref);
       EEPROM.put(ADDR_GAIN_IB, novoGanho); write16(0x66, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao IB Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao IB Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_IC:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IC, ref);
       EEPROM.put(ADDR_GAIN_IC, novoGanho); write16(0x6A, novoGanho);
-      ESP8266.println("{\"INFO\":\"Calibracao IC Salva!\"}"); wdt_enable(WDTO_250MS); 
+      ESP8266.println("{\"INFO\":\"Calibracao IC Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     
     contador = 0; COMANDO = "";
@@ -221,7 +225,9 @@ void loop() {
   // --- FECHAMENTO DO MINUTO E ENVIO DO JSON ---
   if (entrada == 0) {
     Agora = millis();
-    
+
+    if (N_Leituras < 1) N_Leituras = 1;   // evita divisao por zero (geraria NaN no JSON)
+
     P1 /= N_Leituras; P2 /= N_Leituras; P3 /= N_Leituras;
     Q1 /= N_Leituras; Q2 /= N_Leituras; Q3 /= N_Leituras;
     FPA /= N_Leituras; FPB /= N_Leituras; FPC /= N_Leituras;
@@ -245,7 +251,7 @@ void loop() {
     if (V_A == 0 && V_B == 0 && V_C == 0) FREQ = 0;
 
     StaticJsonDocument<512> doc;
-    doc["ID"] = "MEDIDOR_UFCG_LABMET"; // <--- ATENÇÃO AO ID AQUI!
+    doc["ID"] = "MEDIDOR_UFCG";  // CASA. O do laboratorio usa MEDIDOR_UFCG_LABMET.
     doc["P1"] = P1; doc["P2"] = P2; doc["P3"] = P3;
     doc["Q1"] = Q1; doc["Q2"] = Q2; doc["Q3"] = Q3;
     doc["FPA"] = FPA; doc["FPB"] = FPB; doc["FPC"] = FPC;
