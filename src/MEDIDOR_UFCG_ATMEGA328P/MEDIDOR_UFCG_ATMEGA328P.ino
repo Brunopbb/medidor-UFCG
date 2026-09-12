@@ -123,7 +123,9 @@ void loop() {
   while (ESP8266.available() > 0) {
     c = ESP8266.read();
     // 'Q' inicia um comando novo: limpa o buffer para nao concatenar lixo anterior
-    if (c == 'Q') { COMANDO = ""; contador = 1; }
+    // O 'Q' PRECISA entrar no buffer: os tratadores abaixo usam
+    // startsWith("QCALIB_...") e substring(13,...), que contam com ele.
+    if (c == 'Q') { COMANDO = "Q"; contador = 1; }
     else if (c == 'M' && contador == 1) { COMANDO += c; contador = 2; break; }
     else if (contador == 1) {
       if (COMANDO.length() < 40) COMANDO += c;
@@ -133,7 +135,12 @@ void loop() {
 
   if (contador == 2) {
     if (COMANDO == "QRESETM") {
-      delay(500); // Força Watchdog
+      // delay(500) so funcionava com WDTO_250MS. Com WDTO_1S nao estoura mais,
+      // entao o reset e forcado explicitamente.
+      ESP8266.println("{\"INFO\":\"Reiniciando ATMega...\"}");
+      delay(100);
+      wdt_enable(WDTO_15MS);
+      while (1) {}
     }
     
     // ====================================================================
@@ -144,7 +151,7 @@ void loop() {
       wdt_disable(); 
       uint16_t novoGanho = measurementGainCalibration(UA, ref);
       EEPROM.put(ADDR_GAIN_UA, novoGanho); EEPROM.put(ADDR_GAIN_UB, novoGanho); EEPROM.put(ADDR_GAIN_UC, novoGanho);
-      write16(0x61, novoGanho); write16(0x65, novoGanho); write16(0x69, novoGanho);
+      escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao Tensao ALL Salva!\"}");
       wdt_enable(WDTO_1S); 
     }
@@ -153,7 +160,7 @@ void loop() {
       wdt_disable(); 
       uint16_t novoGanho = measurementGainCalibration(IA, ref);
       EEPROM.put(ADDR_GAIN_IA, novoGanho); EEPROM.put(ADDR_GAIN_IB, novoGanho); EEPROM.put(ADDR_GAIN_IC, novoGanho);
-      write16(0x62, novoGanho); write16(0x66, novoGanho); write16(0x6A, novoGanho);
+      escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao Corrente ALL Salva!\"}");
       wdt_enable(WDTO_1S); 
     }
@@ -166,19 +173,19 @@ void loop() {
     else if (COMANDO.startsWith("QCALIB_VA:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UA, ref);
-      EEPROM.put(ADDR_GAIN_UA, novoGanho); write16(0x61, novoGanho);
+      EEPROM.put(ADDR_GAIN_UA, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao VA Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_VB:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UB, ref);
-      EEPROM.put(ADDR_GAIN_UB, novoGanho); write16(0x65, novoGanho);
+      EEPROM.put(ADDR_GAIN_UB, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao VB Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_VC:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(UC, ref);
-      EEPROM.put(ADDR_GAIN_UC, novoGanho); write16(0x69, novoGanho);
+      EEPROM.put(ADDR_GAIN_UC, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao VC Salva!\"}"); wdt_enable(WDTO_1S); 
     }
 
@@ -186,22 +193,58 @@ void loop() {
     else if (COMANDO.startsWith("QCALIB_IA:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IA, ref);
-      EEPROM.put(ADDR_GAIN_IA, novoGanho); write16(0x62, novoGanho);
+      EEPROM.put(ADDR_GAIN_IA, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao IA Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_IB:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IB, ref);
-      EEPROM.put(ADDR_GAIN_IB, novoGanho); write16(0x66, novoGanho);
+      EEPROM.put(ADDR_GAIN_IB, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao IB Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     else if (COMANDO.startsWith("QCALIB_IC:")) {
       float ref = COMANDO.substring(10, COMANDO.length() - 1).toFloat();
       wdt_disable(); uint16_t novoGanho = measurementGainCalibration(IC, ref);
-      EEPROM.put(ADDR_GAIN_IC, novoGanho); write16(0x6A, novoGanho);
+      EEPROM.put(ADDR_GAIN_IC, novoGanho); escreveGanhos(0, 0);
       ESP8266.println("{\"INFO\":\"Calibracao IC Salva!\"}"); wdt_enable(WDTO_1S); 
     }
     
+
+    // --- DIAGNOSTICO: relata os ganhos gravados. O bootloader optiboot do Uno
+    // nao le a EEPROM (avrdude devolve a flash), entao esta e a unica forma
+    // confiavel de conferir a calibracao. ---
+    else if (COMANDO == "QCALIB_GAINSM") {
+      uint16_t gUA, gIA, gUB, gIB, gUC, gIC;
+      EEPROM.get(ADDR_GAIN_UA, gUA); EEPROM.get(ADDR_GAIN_IA, gIA);
+      EEPROM.get(ADDR_GAIN_UB, gUB); EEPROM.get(ADDR_GAIN_IB, gIB);
+      EEPROM.get(ADDR_GAIN_UC, gUC); EEPROM.get(ADDR_GAIN_IC, gIC);
+      ESP8266.print(F("GANHOS UA=")); ESP8266.print(gUA);
+      ESP8266.print(F(" IA="));       ESP8266.print(gIA);
+      ESP8266.print(F(" UB="));       ESP8266.print(gUB);
+      ESP8266.print(F(" IB="));       ESP8266.print(gIB);
+      ESP8266.print(F(" UC="));       ESP8266.print(gUC);
+      ESP8266.print(F(" IC="));       ESP8266.println(gIC);
+    }
+
+    // --- Grava um ganho bruto direto: permite desfazer uma calibracao ruim
+    // sem precisar reproduzir a carga de referencia. ---
+    else if (COMANDO.startsWith("QCALIB_SETGV:")) {
+      uint16_t g = (uint16_t) COMANDO.substring(13, COMANDO.length() - 1).toInt();
+      if (g > 0) {
+        EEPROM.put(ADDR_GAIN_UA, g); EEPROM.put(ADDR_GAIN_UB, g); EEPROM.put(ADDR_GAIN_UC, g);
+        escreveGanhos(0, 0);
+        ESP8266.println(F("{\"INFO\":\"Ganho V gravado direto\"}"));
+      }
+    }
+    else if (COMANDO.startsWith("QCALIB_SETGI:")) {
+      uint16_t g = (uint16_t) COMANDO.substring(13, COMANDO.length() - 1).toInt();
+      if (g > 0) {
+        EEPROM.put(ADDR_GAIN_IA, g); EEPROM.put(ADDR_GAIN_IB, g); EEPROM.put(ADDR_GAIN_IC, g);
+        escreveGanhos(0, 0);
+        ESP8266.println(F("{\"INFO\":\"Ganho I gravado direto\"}"));
+      }
+    }
+
     contador = 0; COMANDO = "";
   }
 
@@ -303,16 +346,53 @@ bool pmicSetup() {
   return !checksumStatus(CONFIG);
 }
 
+// Os registradores de ganho (0x61..0x6E) so aceitam escrita com o chip em modo
+// de configuracao (0x60 = 0x5678), e o checksum de 0x6F precisa ser refeito.
+//
+// CRITICO: e obrigatorio reescrever OS SEIS ganhos a cada entrada em modo de
+// configuracao. Reescrever so parte deles faz os demais voltarem ao padrao de
+// fabrica. Observado em 31/08/2026: gravar apenas os de corrente jogou a
+// tensao de 200 V para 899 V, embora a EEPROM continuasse intacta.
+//
+// regForcado != 0 substitui aquele registrador por valForcado sem tocar na
+// EEPROM (usado na medicao de referencia da calibracao).
+void escreveGanhos(uint8_t regForcado, uint16_t valForcado) {
+  uint16_t gUA, gIA, gUB, gIB, gUC, gIC;
+  EEPROM.get(ADDR_GAIN_UA, gUA); EEPROM.get(ADDR_GAIN_IA, gIA);
+  EEPROM.get(ADDR_GAIN_UB, gUB); EEPROM.get(ADDR_GAIN_IB, gIB);
+  EEPROM.get(ADDR_GAIN_UC, gUC); EEPROM.get(ADDR_GAIN_IC, gIC);
+
+  if (gUA == 0xFFFF || gUA == 0) gUA = 47751;
+  if (gIA == 0xFFFF || gIA == 0) gIA = 12890;
+  if (gUB == 0xFFFF || gUB == 0) gUB = 47751;
+  if (gIB == 0xFFFF || gIB == 0) gIB = 12890;
+  if (gUC == 0xFFFF || gUC == 0) gUC = 47751;
+  if (gIC == 0xFFFF || gIC == 0) gIC = 12890;
+
+  if      (regForcado == 0x61) gUA = valForcado;
+  else if (regForcado == 0x65) gUB = valForcado;
+  else if (regForcado == 0x69) gUC = valForcado;
+  else if (regForcado == 0x62) gIA = valForcado;
+  else if (regForcado == 0x66) gIB = valForcado;
+  else if (regForcado == 0x6A) gIC = valForcado;
+
+  measurementCalibration(START);
+  write16(0x61, gUA); write16(0x65, gUB); write16(0x69, gUC);
+  write16(0x62, gIA); write16(0x66, gIB); write16(0x6A, gIC);
+  write16(0x6D, 0);
+  measurementCalibration(END);
+}
+
 uint16_t measurementGainCalibration(int channel, float ref) {
   uint8_t i; 
   uint32_t calc_gain; 
   float meas = 0;
   
-  if (channel <= UC) {
-    write16(0x61 + channel * 4, 52800);
-  } else {
-    write16(0x62 + (channel - 4) * 4, 30000);
-  }
+  uint8_t  reg  = (channel <= UC) ? (0x61 + channel * 4) : (0x62 + (channel - 4) * 4);
+  uint16_t base = (channel <= UC) ? 52800 : 30000;
+
+  // Ganho de referencia entra destravado; a medicao acontece em modo normal.
+  escreveGanhos(reg, base);
   delay(200); 
 
   for (i = 0; i < N; i++) {
@@ -323,13 +403,9 @@ uint16_t measurementGainCalibration(int channel, float ref) {
   }
   meas = meas / N;
 
-  if (meas < 0.1) return (channel <= UC) ? 52800 : 30000;
+  if (meas < 0.1) return base;
 
-  if (channel <= UC) {
-    calc_gain = (uint32_t)(52800 * (ref / meas));
-  } else {
-    calc_gain = (uint32_t)(30000 * (ref / meas));
-  }
+  calc_gain = (uint32_t)(base * (ref / meas));
 
   if (calc_gain > 65000) calc_gain = 65000;
 
