@@ -47,6 +47,18 @@ int N_Leituras = 0, entrada = 0, contador = 0;
 String COMANDO = ""; 
 unsigned long Agora;
 
+// Acumulado de energia em contagens do ATM90E36A desde o boot.
+// Os registradores 0x80..0x93 sao read-to-clear: cada leitura devolve o que foi
+// acumulado desde a anterior e zera o contador. Somando aqui, o medidor publica
+// um valor absoluto, e nao um incremento: se uma mensagem se perder, a seguinte
+// ainda traz o total, como um hodometro.
+// Nao gravamos na EEPROM de proposito. Uma escrita por minuto esgotaria os
+// 100 mil ciclos em 69 dias, e o unico evento que zera o acumulador e a perda
+// de alimentacao, durante a qual o consumo real tambem e zero. O servidor
+// detecta a queda do valor e trata como reinicio de contador.
+// uint32 comporta cerca de 13,4 MWh, mais de tres anos no consumo desta casa.
+uint32_t energiaContagem = 0;
+
 uint16_t read16(uint16_t);
 void write16(uint16_t, uint16_t);
 bool pmicSetup();
@@ -293,8 +305,20 @@ void loop() {
 
     if (V_A == 0 && V_B == 0 && V_C == 0) FREQ = 0;
 
+    // --- ACUMULADORES DE ENERGIA DO ATM90E36A ---
+    // Leitura read-to-clear: devolve a energia integrada por HARDWARE desde a
+    // leitura anterior, ou seja, deste minuto. E mais exato que multiplicar a
+    // media de potencia por 60 s, porque nao depende da uniformidade da
+    // amostragem dentro do minuto.
+    uint16_t e_minuto = read16(0x80);   // ativa direta total
+    uint16_t e_rev    = read16(0x84);   // ativa reversa: deve ficar em zero
+    energiaContagem += e_minuto;
+
     StaticJsonDocument<512> doc;
     doc["ID"] = "MEDIDOR_UFCG";  // CASA. O do laboratorio usa MEDIDOR_UFCG_LABMET.
+    doc["EMIN"] = e_minuto;          // contagens neste minuto
+    doc["EACC"] = energiaContagem;   // contagens desde o boot
+    doc["EREV"] = e_rev;             // reversa, zero se o TC estiver correto
     doc["P1"] = P1; doc["P2"] = P2; doc["P3"] = P3;
     doc["Q1"] = Q1; doc["Q2"] = Q2; doc["Q3"] = Q3;
     doc["FPA"] = FPA; doc["FPB"] = FPB; doc["FPC"] = FPC;
@@ -341,6 +365,16 @@ bool pmicSetup() {
   digitalWrite(M90_CHIP_SELECT, HIGH);
   write16(0x00, 0x789A); delay(100);
   write16(0x30, 0x5678); write16(0x33, 0x1087);
+
+  // PL_Constant define quanta energia vale uma contagem dos acumuladores
+  // 0x80..0x93. O projeto nunca escreveu esses registradores, entao o chip
+  // usava o padrao de fabrica e a conversao para kWh era desconhecida.
+  // Com 0x0861C468 vale a relacao validada  kWh = contagens / 100 / 3200.
+  // Nao afeta tensao, corrente nem potencia: essas vem de outros registradores,
+  // com resolucao propria (URES, IRES, POWRES).
+  write16(0x31, 0x0861);   // PLconstH
+  write16(0x32, 0xC468);   // PLconstL
+
   write16(0x3B, csCalculator(0x31, 0x3A));
   write16(0x30, 0x8765); delay(1000);
   return !checksumStatus(CONFIG);

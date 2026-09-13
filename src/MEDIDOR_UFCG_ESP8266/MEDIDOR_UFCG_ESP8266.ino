@@ -5,7 +5,7 @@
 #include <LittleFS.h>
 #include "secrets.h"
 
-#define FIRMWARE_VERSION "1.0.20" 
+#define FIRMWARE_VERSION "1.0.21" 
 
 const char *SSID = SECRET_SSID;
 const char *PASSWORD = SECRET_PASSWORD;
@@ -20,7 +20,7 @@ const char *TOPIC_SUBSCRIBE = "MEDIDOR_UFCG_CONTROLE_CASA";
 
 // Linha lida da serial. Era um String: trocado por buffer fixo porque a
 // realocacao a cada minuto fragmentava o heap (frag chegou a 9% em 30/08).
-char linha[512];
+char linha[600];
 
 int tentativa;
 unsigned long Agora;
@@ -128,7 +128,7 @@ void setup() {
   Serial.println();
   Serial.println("=== BOOT: MEDIDOR CASA ===");
   
-  client.setBufferSize(512);
+  client.setBufferSize(640);
   // O PubSubClient so descobre um socket morto pelo keepalive: 60 s sem receber
   // nada dispara PINGREQ, outros 60 s sem PINGRESP encerram. Com keepAlive=60
   // isso davam ate 2 MINUTOS acreditando estar conectado, publicando no vazio -
@@ -141,6 +141,11 @@ void setup() {
   client.setSocketTimeout(5);   // era 20: cada connect() falho travava o loop 20 s
   client.setCallback(Callback);
   
+  // Hora por NTP. As leituras recuperadas da fila chegam muito depois de terem
+  // sido medidas, e o Telegraf carimba a hora na chegada. Com o campo ts a hora
+  // real da medicao viaja junto com o dado.
+  configTime(0, 0, "a.st1.ntp.br", "pool.ntp.org");
+
   // Monta a fila em flash. Se a area nunca foi formatada (caso do primeiro
   // boot apos o OTA), formata uma vez.
   fsOk = LittleFS.begin();
@@ -278,13 +283,31 @@ void loop() {
   // 7. Destino da leitura
   if (linha[0] != '\0') {
     if (linha[0] == '{') {
-      // Com fila pendente, a nova leitura vai para o fim dela: preserva a ordem.
       contLidas++;
-      if (client.connected() && !spoolPendente()) {
-        if (client.publish(TOPIC_PUBLISH, linha)) contPub++;
-        else if (spoolAnexa(linha)) contFila++;
+
+      // Acrescenta a identidade temporal ANTES de publicar ou enfileirar:
+      //   up = segundos desde o boot. Se for menor que a lacuna, houve reboot,
+      //        logo o medidor ficou sem alimentacao e o consumo real foi zero.
+      //   ts = epoch da medicao. Vai junto com o dado, entao uma leitura
+      //        recuperada horas depois ainda sabe quando foi medida.
+      // O ts so entra se o NTP ja sincronizou, senao o campo e omitido e o
+      // servidor continua usando a hora de chegada.
+      char saida[640];
+      time_t agora = time(nullptr);
+      if (agora > 1600000000L) {
+        snprintf(saida, sizeof(saida), "{\"up\":%lu,\"ts\":%lu,%s",
+                 millis() / 1000UL, (unsigned long)agora, linha + 1);
       } else {
-        if (spoolAnexa(linha)) contFila++;
+        snprintf(saida, sizeof(saida), "{\"up\":%lu,%s",
+                 millis() / 1000UL, linha + 1);
+      }
+
+      // Com fila pendente, a nova leitura vai para o fim dela: preserva a ordem.
+      if (client.connected() && !spoolPendente()) {
+        if (client.publish(TOPIC_PUBLISH, saida)) contPub++;
+        else if (spoolAnexa(saida)) contFila++;
+      } else {
+        if (spoolAnexa(saida)) contFila++;
       }
     } else if (client.connected()) {
       client.publish(TOPIC_LOG, linha);
@@ -309,7 +332,7 @@ void drenaSpool(void) {
   if (!f) return;
   f.seek(spoolPos);
 
-  char buf[512];
+  char buf[600];
   uint8_t enviados = 0;
   while (enviados < 3 && f.available()) {
     size_t n = f.readBytesUntil('\n', buf, sizeof(buf) - 1);
