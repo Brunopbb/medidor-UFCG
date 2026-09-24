@@ -3,9 +3,24 @@
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
 #include <LittleFS.h>
+
+extern "C" {
+  #include "user_interface.h"
+}
+
+// Forca calibracao completa de RF em todo boot. Por padrao o ESP8266 reaproveita
+// a calibracao anterior, e um estado ruim sobrevive ao ESP.restart(). Custa cerca
+// de 200 ms no boot e elimina uma das causas de travamento do radio.
+extern "C" void preinit(void) {
+  system_phy_set_powerup_option(3);
+}
 #include "secrets.h"
 
-#define FIRMWARE_VERSION "1.0.21" 
+// O conversor A/D passa a medir a alimentacao do proprio ESP (VDD3P3), em mV.
+// O firmware nao usa analogRead, entao nao ha o que perder.
+ADC_MODE(ADC_VCC);
+
+#define FIRMWARE_VERSION "1.0.26" 
 
 const char *SSID = SECRET_SSID;
 const char *PASSWORD = SECRET_PASSWORD;
@@ -15,8 +30,16 @@ const char *URL_FIRMWARE = SECRET_URL_FIRMWARE;
 
 const char *CLIENT_ID = "MEDIDOR_UFCG";           // medidor de CASA (o do LABMET usa MEDIDOR_UFCG_LABMET)
 const char *TOPIC_PUBLISH = "/UFCG/pwrc/";
-const char *TOPIC_LOG = "/UFCG/pwrc/log";
+const char *TOPIC_LOG = "/UFCG/pwrc/log/casa";   // separado do LABMET; o servidor grava /UFCG/pwrc/log/#
 const char *TOPIC_SUBSCRIBE = "MEDIDOR_UFCG_CONTROLE_CASA";
+
+// Potencia de transmissao do Wi-Fi (dBm). O padrao do ESP8266 e 20,5 dBm, e os
+// picos de corrente de TX (~170 mA) saem da mesma fonte de 3,3 V que alimenta a
+// placa inteira, com so 10 uF junto ao ESP. O roteador fica a poucos metros:
+// RSSI de -34 dBm em 23/09. Com 12 dBm o enlace ainda sobra em mais de 40 dB e
+// o pico de TX cai bastante. Tentativa por software contra os travamentos
+// (1.0.25), ja que a placa nao sera modificada.
+#define WIFI_TX_DBM 12.0f
 
 // Linha lida da serial. Era um String: trocado por buffer fixo porque a
 // realocacao a cada minuto fragmentava o heap (frag chegou a 9% em 30/08).
@@ -28,6 +51,7 @@ unsigned long ultimaTentativaMQTT = 0;
 unsigned long intervaloMQTT = 5000;
 unsigned long conexaoDesde = 0;   // quando a sessao MQTT atual foi estabelecida
 unsigned long ultimaTentativaWifi = 0;
+unsigned long ultimaVezComWifi = 0;
 unsigned long ultimaConexaoOk = 0;
 unsigned long ultimoStatus = 0;
 unsigned long ultimoOTA = 0;
@@ -115,6 +139,80 @@ void drenaSpool(void);
 WiFiClient WifiClient;
 PubSubClient client(BROKER, 1883, WifiClient);
 
+// --- DIAGNOSTICO PERSISTENTE (1.0.23) ---
+// Entre 20 e 23/09 o medidor travou sete vezes, com dois ESPs diferentes, e so
+// voltou com corte de energia. Nada do que acontece durante a queda chega ao
+// servidor, e o corte apaga a RAM. Este registro vai para a flash e e publicado
+// quando o medidor volta, para distinguir: ESP parado, ESP vivo sem conseguir
+// associar ao Wi-Fi (e com qual codigo), ou reiniciando em ciclo.
+#define DIAG_ARQ  "/diag.log"
+#define DIAG_OLD  "/diag.old"
+#define DIAG_MAX  8000UL
+
+uint16_t vccMin      = 65535;   // menor alimentacao (mV) desde o ultimo status
+uint16_t vccMinBoot  = 65535;   // menor alimentacao (mV) desde o boot
+unsigned long ultimaAmostraVcc = 0;
+volatile uint16_t wifiDesc = 0; // desconexoes de Wi-Fi desde o ultimo registro
+volatile uint8_t  wifiMotivo = 0;   // ultimo codigo 802.11 de desconexao
+uint16_t wifiDescTotal = 0;
+bool wifiEstavaOk = false;
+bool mqttEstavaOk = false;
+unsigned long ultimoDiagWifi = 0;
+unsigned long semWifiDesde = 0;
+bool diagPendente = true;       // ha registro na flash ainda nao publicado
+uint32_t diagPos = 0;
+WiFiEventHandler hDesc;
+
+void diagRegistra(const char *evento) {
+  if (!fsOk) return;
+  File f = LittleFS.open(DIAG_ARQ, "a");
+  if (!f) return;
+  if (f.size() > DIAG_MAX) {            // gira: guarda o bloco anterior inteiro
+    f.close();
+    LittleFS.remove(DIAG_OLD);
+    LittleFS.rename(DIAG_ARQ, DIAG_OLD);
+    diagPos = 0;
+    f = LittleFS.open(DIAG_ARQ, "a");
+    if (!f) return;
+  }
+  time_t t = time(nullptr);
+  f.printf("t=%lu up=%lu vcc=%u vmin=%u %s\n",
+           (t > 1600000000L) ? (unsigned long)t : 0UL, millis() / 1000UL,
+           (unsigned)ESP.getVcc(), (unsigned)vccMinBoot, evento);
+  f.close();
+  diagPendente = true;
+}
+
+// Publica o registro em lotes de 4 linhas por passagem do loop, como a fila de
+// leituras, para nao travar a serial. Primeiro o bloco antigo, depois o atual.
+void diagPublica(void) {
+  if (!diagPendente || !fsOk || !client.connected()) return;
+  if (conexaoDesde == 0 || (millis() - conexaoDesde) < 10000) return;
+  const char *arq = LittleFS.exists(DIAG_OLD) ? DIAG_OLD : DIAG_ARQ;
+  File f = LittleFS.open(arq, "r");
+  if (!f) { diagPendente = LittleFS.exists(DIAG_ARQ); diagPos = 0; return; }
+  f.seek(diagPos);
+  char buf[200];
+  memcpy(buf, "DIAG ", 5);
+  uint8_t n = 0;
+  while (n < 4 && f.available()) {
+    size_t k = f.readBytesUntil('\n', buf + 5, sizeof(buf) - 6);
+    buf[5 + k] = '\0';
+    if (k == 0) continue;
+    if (!client.publish(TOPIC_LOG, buf)) { f.close(); return; }
+    diagPos = f.position();
+    n++;
+  }
+  bool fim = !f.available();
+  f.close();
+  if (fim) {
+    LittleFS.remove(arq);
+    diagPos = 0;
+    diagPendente = LittleFS.exists(DIAG_ARQ) || LittleFS.exists(DIAG_OLD);
+  }
+}
+
+
 void setup() {
   // O buffer de RX padrao tem 256 bytes e o JSON do ATMega tem ~380. Qualquer
   // bloqueio do loop() (o client.connect() e bloqueante) destruia a leitura por
@@ -155,6 +253,18 @@ void setup() {
     fsOk = LittleFS.begin();
   }
   if (fsOk) spoolCarrega();
+
+  hDesc = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &e) {
+    wifiDesc++; wifiDescTotal++; wifiMotivo = (uint8_t)e.reason;   // so contadores: sem E/S aqui
+  });
+  {
+    rst_info *ri = ESP.getResetInfoPtr();
+    char ev[150];
+    snprintf(ev, sizeof(ev), "BOOT motivo=%u(%s) exc=%u epc1=0x%08lx versao=%s",
+             (unsigned)ri->reason, ESP.getResetReason().c_str(), (unsigned)ri->exccause,
+             (unsigned long)ri->epc1, FIRMWARE_VERSION);
+    diagRegistra(ev);
+  }
   Serial.print("LittleFS: "); Serial.println(fsOk ? "ok" : "FALHOU");
 
   ConnectWifi();
@@ -175,7 +285,8 @@ void setup() {
     Serial.println(fsmsg);
   }
 
-  String msgBoot = "Medidor Iniciado. Versao: " + String(FIRMWARE_VERSION);
+  String msgBoot = "Medidor Iniciado. Versao: " + String(FIRMWARE_VERSION) +
+                   " reset=" + ESP.getResetReason() + " vcc=" + String(ESP.getVcc()) + "mV";
   client.publish(TOPIC_LOG, msgBoot.c_str());
   Serial.println(msgBoot);
   delay(1000);
@@ -226,11 +337,78 @@ void loop() {
   // 2. Wi-Fi: reconexao NAO bloqueante. A versao anterior chamava ConnectWifi(),
   //    que ficava ate 45 s em delay(1000) sem ler a serial. Era essa a origem
   //    das lacunas de 2 a 4 minutos.
+  // RECUPERACAO ESCALONADA DE WI-FI
+  // A maquina de estados do radio do ESP8266 as vezes trava: ele fica tentando
+  // associar indefinidamente, com o LED piscando, e NEM ESP.restart() resolve.
+  // So o corte de alimentacao limpa, porque zera o estado de RF. Desligar e
+  // religar o radio por software reproduz esse efeito sem intervencao humana.
+  // Observado em 15 e 16/09: o usuario teve de cortar a energia da placa oito
+  // vezes para o medidor voltar.
+  // Amostra a alimentacao 1x/s. Mais rapido que isso o ADC atrapalha o radio.
+  if (millis() - ultimaAmostraVcc >= 1000) {
+    ultimaAmostraVcc = millis();
+    uint16_t v = ESP.getVcc();
+    if (v < vccMin) vccMin = v;
+    if (v < vccMinBoot) vccMinBoot = v;
+  }
+
+  // Transicoes de Wi-Fi vao para a flash. Durante uma queda, um resumo a cada
+  // 1 min nos primeiros 10 min e depois a cada 5 min (poupa a flash).
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiEstavaOk && semWifiDesde) {
+      char ev[90];
+      snprintf(ev, sizeof(ev), "WIFI_VOLTOU apos=%lus rssi=%d", (millis() - semWifiDesde) / 1000UL, WiFi.RSSI());
+      diagRegistra(ev);
+    }
+    wifiEstavaOk = true; semWifiDesde = 0;
+  } else {
+    if (wifiEstavaOk || semWifiDesde == 0) {
+      semWifiDesde = millis(); ultimoDiagWifi = millis();
+      char ev[70];
+      snprintf(ev, sizeof(ev), "WIFI_CAIU motivo=%u status=%d", (unsigned)wifiMotivo, (int)WiFi.status());
+      diagRegistra(ev);
+      wifiDesc = 0;
+    }
+    wifiEstavaOk = false;
+    unsigned long fora = millis() - semWifiDesde;
+    if (millis() - ultimoDiagWifi >= (fora < 600000UL ? 60000UL : 300000UL)) {
+      ultimoDiagWifi = millis();
+      char ev[90];
+      snprintf(ev, sizeof(ev), "WIFI_FORA ha=%lus tentativas_falhas=%u motivo=%u status=%d",
+               fora / 1000UL, (unsigned)wifiDesc, (unsigned)wifiMotivo, (int)WiFi.status());
+      diagRegistra(ev);
+      wifiDesc = 0;
+    }
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - ultimaTentativaWifi > 15000) {
       ultimaTentativaWifi = millis();
-      WiFi.begin(SSID, PASSWORD);
+      unsigned long semWifi = millis() - ultimaVezComWifi;
+
+      if (semWifi > 300000UL) {
+        // 5 min travado: ultimo recurso antes de depender de intervencao
+        Serial.println("Wi-Fi travado ha 5 min. Reiniciando o modulo...");
+        diagRegistra("REINICIO por 5 min sem Wi-Fi");
+        delay(50);
+        ESP.restart();
+      } else if (semWifi > 60000UL) {
+        // 1 min travado: religa o radio, equivalente por software ao corte
+        Serial.println("Wi-Fi travado. Religando o radio...");
+        if (semWifi < 76000UL) diagRegistra("RADIO religado apos 1 min sem Wi-Fi");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(250);
+        WiFi.mode(WIFI_STA);
+        WiFi.setOutputPower(WIFI_TX_DBM);
+        WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+        WiFi.begin(SSID, PASSWORD);
+      } else {
+        WiFi.begin(SSID, PASSWORD);
+      }
     }
+  } else {
+    ultimaVezComWifi = millis();
   }
 
   // 3. MQTT: so tenta com Wi-Fi de pe, e sem bloquear.
@@ -252,11 +430,22 @@ void loop() {
     client.loop();
     ultimaConexaoOk = millis();
     drenaSpool();
+    diagPublica();
+  }
+  if (client.connected()) {
+    mqttEstavaOk = true;
+  } else if (mqttEstavaOk) {
+    mqttEstavaOk = false;
+    char ev[80];
+    snprintf(ev, sizeof(ev), "MQTT_CAIU estado=%d wifi=%d rssi=%d",
+             client.state(), (int)WiFi.status(), WiFi.RSSI());
+    diagRegistra(ev);
   }
 
   // 4. Salvaguarda: 15 min sem broker e sinal de travamento real.
   if (ultimaConexaoOk != 0 && (millis() - ultimaConexaoOk > 900000UL)) {
     Serial.println("15 min sem MQTT. Reiniciando...");
+    diagRegistra("REINICIO por 15 min sem MQTT");
     delay(100);
     ESP.restart();
   }
@@ -270,14 +459,21 @@ void loop() {
   // 6. Diagnostico de rede a cada 60s
   if (client.connected() && (millis() - ultimoStatus > 60000)) {
     ultimoStatus = millis();
-    char st[200];
-    snprintf(st, sizeof(st), "RSSI=%ddBm heap=%u frag=%u%% up=%lus fila=%u fs=%d perdas=%u lidas=%u pub=%u enf=%u",
-             WiFi.RSSI(),
+    char st[240];
+    snprintf(st, sizeof(st), "RSSI=%ddBm tx=%.0fdBm vcc=%umV vmin=%umV vmin_boot=%umV wdesc=%u heap=%u frag=%u%% up=%lus fila=%u fs=%d perdas=%u lidas=%u pub=%u enf=%u",
+             WiFi.RSSI(), (double)WIFI_TX_DBM, (unsigned)ESP.getVcc(), (unsigned)vccMin, (unsigned)vccMinBoot, (unsigned)wifiDescTotal,
              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapFragmentation(),
              millis() / 1000UL, (unsigned)spoolQtd,
              fsOk ? 1 : 0, (unsigned)spoolFalhas,
              (unsigned)contLidas, (unsigned)contPub, (unsigned)contFila);
     client.publish(TOPIC_LOG, st);
+    vccMin = 65535;
+
+    // Sinal de vida para o cao de guarda do ATMega (versao A2): so e enviado
+    // com o broker conectado. Se ele parar por 20 min, o ATMega aplica um reset
+    // por hardware no pino RST do ESP. Um ATMega antigo descarta o comando.
+    // O texto nao pode conter 'Q' nem 'M' no meio: e o delimitador do parser.
+    Serial.print("QVIVOM");
   }
 
   // 7. Destino da leitura
@@ -361,6 +557,7 @@ void ConnectWifi(void) {
   // NAO usar WIFI_NONE_SLEEP nesta placa: o radio sempre ligado sobe o consumo
   // de ~15mA medios para ~70mA constantes. Medido em 29/08: sem ganho de cobertura.
   WiFi.mode(WIFI_STA);
+  WiFi.setOutputPower(WIFI_TX_DBM);
   WiFi.setSleepMode(WIFI_MODEM_SLEEP);
   WiFi.setAutoReconnect(true);
 
@@ -403,6 +600,11 @@ void connectMQTT(void) {
     if (client.connect(CLIENT_ID, SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
       Serial.println("SUCESSO: Conectado ao broker MQTT!");
       client.subscribe(TOPIC_SUBSCRIBE);
+      // Sem isto a sessao aberta no boot nunca era "assentada": drenaSpool() e
+      // diagPublica() esperavam uma reconexao pelo loop(). Na pratica, as
+      // leituras presas na fila depois de um corte de energia so desciam na
+      // proxima queda de rede. Corrigido no 1.0.24.
+      conexaoDesde = millis();
       Serial.print("Inscrito no topico: ");
       Serial.println(TOPIC_SUBSCRIBE);
     } else {

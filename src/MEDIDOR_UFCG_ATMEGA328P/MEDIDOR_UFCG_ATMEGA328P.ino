@@ -52,12 +52,91 @@ unsigned long Agora;
 // acumulado desde a anterior e zera o contador. Somando aqui, o medidor publica
 // um valor absoluto, e nao um incremento: se uma mensagem se perder, a seguinte
 // ainda traz o total, como um hodometro.
-// Nao gravamos na EEPROM de proposito. Uma escrita por minuto esgotaria os
-// 100 mil ciclos em 69 dias, e o unico evento que zera o acumulador e a perda
-// de alimentacao, durante a qual o consumo real tambem e zero. O servidor
-// detecta a queda do valor e trata como reinicio de contador.
-// uint32 comporta cerca de 13,4 MWh, mais de tres anos no consumo desta casa.
+// PERSISTENCIA (versao A2, 24/09/2026). A premissa anterior - "so perda de
+// alimentacao zera o acumulador, e nela o consumo tambem e zero" - estava
+// errada: quando o ESP trava, o ATMega continua contando, e a unica forma de
+// recuperar era cortar a energia da placa, o que apagava tudo o que foi contado
+// durante a queda. Entre 20 e 23/09 isso custou ~4 kWh.
+// Agora o acumulado vai para a EEPROM a cada minuto, em 64 posicoes que se
+// revezam: cada posicao e escrita a cada 64 min, ~22 vezes por dia, e os 100 mil
+// ciclos da EEPROM duram mais de 12 anos. Cada registro leva um numero de
+// sequencia e uma soma de verificacao; uma escrita interrompida por falta de
+// energia fica invalida e o boot usa a anterior (no maximo 1 min mais velha).
+// uint32 comporta cerca de 5,6 GWh na constante atual.
 uint32_t energiaContagem = 0;
+
+#define EE_MARCA      90       // 2 bytes: presenca indica regiao ja formatada
+#define EE_SLOT_BASE  100      // 0..11 sao os ganhos; deixa folga
+#define EE_SLOTS      64
+#define EE_SLOT_TAM   10       // seq(4) + contagem(4) + verificacao(2)
+uint32_t eeSeq = 0;
+
+uint16_t eeVerif(uint32_t seq, uint32_t cont) {
+  uint16_t v = 0x5A5A;
+  for (uint8_t i = 0; i < 4; i++) { v = (v << 1 | v >> 15) ^ (uint8_t)(seq >> (8 * i)); }
+  for (uint8_t i = 0; i < 4; i++) { v = (v << 1 | v >> 15) ^ (uint8_t)(cont >> (8 * i)); }
+  return v;
+}
+
+// Procura o registro valido com a maior sequencia. Sem nenhum valido, comeca do zero.
+// Na primeira execucao desta versao a regiao pode conter lixo de outro programa;
+// um lixo que passasse na verificacao restauraria um contador absurdo e somaria
+// energia fantasma no servidor. Por isso a regiao e zerada uma unica vez.
+void eeCarrega(void) {
+  if (EEPROM.read(EE_MARCA) != 0xA2 || EEPROM.read(EE_MARCA + 1) != 0x5E) {
+    for (int a = EE_SLOT_BASE; a < EE_SLOT_BASE + EE_SLOTS * EE_SLOT_TAM; a++) EEPROM.update(a, 0xFF);
+    EEPROM.update(EE_MARCA, 0xA2);
+    EEPROM.update(EE_MARCA + 1, 0x5E);
+    eeSeq = 0; energiaContagem = 0;
+    return;
+  }
+  uint32_t melhorSeq = 0, melhorCont = 0; bool achou = false;
+  for (uint8_t i = 0; i < EE_SLOTS; i++) {
+    int a = EE_SLOT_BASE + i * EE_SLOT_TAM;
+    uint32_t sq, ct; uint16_t vf;
+    EEPROM.get(a, sq); EEPROM.get(a + 4, ct); EEPROM.get(a + 8, vf);
+    if (sq == 0xFFFFFFFFUL || vf != eeVerif(sq, ct)) continue;
+    if (!achou || sq > melhorSeq) { melhorSeq = sq; melhorCont = ct; achou = true; }
+  }
+  eeSeq = achou ? melhorSeq : 0;
+  energiaContagem = achou ? melhorCont : 0;
+}
+
+void eeGrava(void) {
+  eeSeq++;
+  int a = EE_SLOT_BASE + (eeSeq % EE_SLOTS) * EE_SLOT_TAM;
+  EEPROM.put(a, eeSeq);
+  EEPROM.put(a + 4, energiaContagem);
+  EEPROM.put(a + 8, eeVerif(eeSeq, energiaContagem));   // por ultimo: sela o registro
+}
+
+// --- CAO DE GUARDA DO ESP8266 (versao A2) ---
+// O ESP trava de forma que so um corte de energia recupera (sete vezes entre 20
+// e 23/09); nem o ESP.restart() dele resolve. O ESP passa a mandar "QVIVOM" a
+// cada minuto enquanto esta conectado ao broker. Sem esse sinal por 20 min -
+// alem da salvaguarda de 15 min do proprio ESP - o ATMega aplica um reset por
+// hardware no pino RST do ESP, e repete a cada 20 min enquanto o silencio durar.
+// Qual pino chega ao RST do ESP: o esquematico (Novo Medidor 3.1.3) liga o RST
+// ao pino 15 = D9; o firmware original pulsava o D5 no boot. Como nao foi
+// possivel conferir a placa, o reset pulsa os dois. O D9 fica em alta impedancia
+// fora do pulso, para nunca forcar nivel contra o pull-up do modulo.
+#define PINO_RST_ESP     9
+#define PINO_RST_ESP_ANT 5
+#define ESP_MUDO_MS      1200000UL
+#define FW_ATMEGA        2
+unsigned long refEsp = 0;      // ultimo sinal de vida OU ultimo reset aplicado
+uint16_t resetsEsp = 0;
+
+void resetaEsp(void) {
+  digitalWrite(PINO_RST_ESP_ANT, LOW);
+  pinMode(PINO_RST_ESP, OUTPUT);
+  digitalWrite(PINO_RST_ESP, LOW);
+  delay(200);
+  pinMode(PINO_RST_ESP, INPUT);
+  digitalWrite(PINO_RST_ESP_ANT, HIGH);
+  resetsEsp++;
+  refEsp = millis();
+}
 
 uint16_t read16(uint16_t);
 void write16(uint16_t, uint16_t);
@@ -124,6 +203,10 @@ void setup() {
   write16(0x4C, 284); 
   energyCalibration(END);
 
+  eeCarrega();                    // retoma o acumulado de onde parou
+  pinMode(PINO_RST_ESP, INPUT);   // fora do pulso, sem forcar nivel no RST do ESP
+  refEsp = millis();              // carencia: o ESP tem 20 min para dar sinal
+
   delay(1000);
   Agora = millis();
 }
@@ -146,7 +229,10 @@ void loop() {
   }
 
   if (contador == 2) {
-    if (COMANDO == "QRESETM") {
+    if (COMANDO == "QVIVOM") {
+      refEsp = millis();
+    }
+    else if (COMANDO == "QRESETM") {
       // delay(500) so funcionava com WDTO_250MS. Com WDTO_1S nao estoura mais,
       // entao o reset e forcado explicitamente.
       ESP8266.println("{\"INFO\":\"Reiniciando ATMega...\"}");
@@ -262,6 +348,9 @@ void loop() {
 
   entrada = 0;
 
+  // --- CAO DE GUARDA DO ESP ---
+  if (millis() - refEsp > ESP_MUDO_MS) resetaEsp();
+
   // --- ACÚMULO DE DADOS DENTRO DE 1 MINUTO (FIXO) ---
   if ((millis() - Agora) < 60000) {
     P1 += activePower(UA); P2 += activePower(UB); P3 += activePower(UC);
@@ -317,7 +406,9 @@ void loop() {
     StaticJsonDocument<512> doc;
     doc["ID"] = "MEDIDOR_UFCG";  // CASA. O do laboratorio usa MEDIDOR_UFCG_LABMET.
     doc["EMIN"] = e_minuto;          // contagens neste minuto
-    doc["EACC"] = energiaContagem;   // contagens desde o boot
+    doc["EACC"] = energiaContagem;   // contagens acumuladas (persistente desde a versao A2)
+    doc["AV"] = FW_ATMEGA;           // versao do firmware do ATMega
+    doc["RESP"] = resetsEsp;         // resets aplicados ao ESP desde o boot do ATMega
     doc["EREV"] = e_rev;             // reversa, zero se o TC estiver correto
     doc["P1"] = P1; doc["P2"] = P2; doc["P3"] = P3;
     doc["Q1"] = Q1; doc["Q2"] = Q2; doc["Q3"] = Q3;
@@ -329,6 +420,8 @@ void loop() {
 
     serializeJson(doc, ESP8266);
     ESP8266.println();
+
+    eeGrava();   // depois do envio: a escrita (ate ~35 ms) nao atrasa o JSON
 
     P1 = P2 = P3 = Q1 = Q2 = Q3 = FPA = FPB = FPC = 0;
     V_A = V_B = V_C = I_A = I_B = I_C = I_N = FREQ = S1 = S2 = S3 = 0;
