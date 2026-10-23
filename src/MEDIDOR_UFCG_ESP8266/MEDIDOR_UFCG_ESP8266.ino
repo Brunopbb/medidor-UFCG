@@ -20,7 +20,9 @@ extern "C" void preinit(void) {
 // O firmware nao usa analogRead, entao nao ha o que perder.
 ADC_MODE(ADC_VCC);
 
-#define FIRMWARE_VERSION "1.0.26" 
+#define FIRMWARE_VERSION "1.0.27"
+// 1.0.27 (27/09/2026): broker e OTA passam para o servidor da casa (bserver,
+// 192.168.1.22, rede local). O medidor deixa de depender da internet para gravar. 
 
 const char *SSID = SECRET_SSID;
 const char *PASSWORD = SECRET_PASSWORD;
